@@ -1,163 +1,225 @@
--- TSB Adaptive Tech Dash & Combo Engine V2
--- Architecture: Async, Memory-Leak Free, Dynamic Ping/FPS Compensation
+-- ==========================================
+-- PART 1: TSB ADAPTIVE CORE ENGINE (DYNAMIC)
+-- Architecture: Dynamic Pointers, Memory Leak Free
+-- ==========================================
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local Stats = game:GetService("Stats")
-local UserInputService = game:GetService("UserInputService")
 
 local LocalPlayer = Players.LocalPlayer
-local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-local RootPart = Character:WaitForChild("HumanoidRootPart")
 
--- Globals & Garbage Collection (Hafıza sızıntısını önlemek için)
-getgenv().TSB_Engine = getgenv().TSB_Engine or {}
-if getgenv().TSB_Engine.Connection then getgenv().TSB_Engine.Connection:Disconnect() end
+getgenv().TSB_Core = getgenv().TSB_Core or {}
 
--- Konfigürasyon ve Adaptif Veriler
-local Settings = {
-    Enabled = false,
-    BaseDelay = 0.20,      -- 0 Ping ve 60 FPS'teki ideal taban gecikme
+getgenv().TSB_Core.Settings = {
+    Enabled = true,
+    BaseDelay = 0.20,
     MaxDistance = 15,
     ClampPower = 20,
-    UseAdaptive = true
+    UseAdaptive = true,
+    AutoTrigger = false -- Yeni: Zıplama/Uppercut hızını otomatik algılama
 }
 
--- [Adaptif Hesaplama Modülü]
--- Ping ve FPS'i okuyarak en doğru milisaniyeyi hesaplar
+-- [Dinamik Karakter Referansı - Öldüğünde bozulmayı engeller]
+local function GetRoot()
+    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        return LocalPlayer.Character.HumanoidRootPart
+    end
+    return nil
+end
+
 local function CalculateAdaptiveDelay()
-    if not Settings.UseAdaptive then return Settings.BaseDelay end
+    local settings = getgenv().TSB_Core.Settings
+    if not settings.UseAdaptive then return settings.BaseDelay end
     
-    -- Anlık Ping Değerini Çek (Ağ Gecikmesi)
     local success, pingVal = pcall(function()
         return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
     end)
     local currentPing = success and pingVal or 50
-
-    -- FPS (Frame Per Second) Değerini Çek (Donanım Gecikmesi)
     local currentFPS = math.floor(1 / RunService.RenderStepped:Wait())
     
-    -- Algoritma: Ping ne kadar yüksekse, o kadar erken tepki vermeliyiz (-)
-    -- FPS ne kadar düşükse, input gecikmesini tolere etmeliyiz
-    local pingCompensation = (currentPing / 1000) * 0.8 -- %80 ağırlık
-    local fpsCompensation = (60 - currentFPS) * 0.002
+    local pingComp = (currentPing / 1000) * 0.85
+    local fpsComp = (60 - currentFPS) * 0.002
     
-    local finalDelay = Settings.BaseDelay - pingCompensation - fpsCompensation
-    
-    -- Sınırlandırma (Çok uçuk değerlere inmesini/çıkmasını engelle)
-    return math.clamp(finalDelay, 0.02, 0.35)
+    return math.clamp(settings.BaseDelay - pingComp - fpsComp, 0.02, 0.35)
 end
 
--- [Hedef Fizik Analizi]
--- Sadece animasyona güvenmek yerine fiziksel durumu tarar
-local function ValidateTarget(targetRoot)
-    if not targetRoot or not targetRoot.Parent then return false end
-    local hum = targetRoot.Parent:FindFirstChild("Humanoid")
-    if not hum or hum.Health <= 0 then return false end
-    
-    local dist = (targetRoot.Position - RootPart.Position).Magnitude
-    return dist <= Settings.MaxDistance
-end
+-- [Motor Çekirdeği]
+getgenv().TSB_Core.ExecuteDash = function(targetRoot)
+    local myRoot = GetRoot()
+    if not myRoot or not targetRoot then return end
 
--- [Core Execution - Çekirdek İşlem]
-local function ExecuteAdaptiveDash(targetRoot)
     task.spawn(function()
-        if not ValidateTarget(targetRoot) then return end
+        local delay = CalculateAdaptiveDelay()
+        task.wait(delay)
         
-        local adaptiveDelay = CalculateAdaptiveDelay()
-        task.wait(adaptiveDelay) -- Ağ ve FPS'e göre hesaplanmış kusursuz bekleme
+        -- CFrame Angle Kitleme
+        local targetPos = Vector3.new(targetRoot.Position.X, myRoot.Position.Y, targetRoot.Position.Z)
+        myRoot.CFrame = CFrame.lookAt(myRoot.Position, targetPos)
         
-        -- 1. Açı Kilidi (CFrame Alignment)
-        local targetPos = Vector3.new(targetRoot.Position.X, RootPart.Position.Y, targetRoot.Position.Z)
-        RootPart.CFrame = CFrame.lookAt(RootPart.Position, targetPos)
-        
-        -- 2. Asenkron Tuş Vuruşu (Q Dash)
+        -- Dash Tetikleme
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
         task.wait(0.015)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
         
-        -- 3. Velocity Clamp (Fizik Kısıtlama - Hedefin Uzağa Fırlamasını Engeller)
+        -- Fizik Kısıtlama (Uzağa Fırlamayı Engeller)
         local t = tick()
         local clampConn
         clampConn = RunService.Heartbeat:Connect(function()
-            if tick() - t > 0.15 then
-                clampConn:Disconnect()
+            local currentRoot = GetRoot()
+            if not currentRoot or tick() - t > 0.15 then
+                if clampConn then clampConn:Disconnect() end
                 return
             end
-            local vel = RootPart.AssemblyLinearVelocity
+            
+            local vel = currentRoot.AssemblyLinearVelocity
             local flat = Vector3.new(vel.X, 0, vel.Z)
-            if flat.Magnitude > Settings.ClampPower then
-                local clamped = flat.Unit * Settings.ClampPower
-                RootPart.AssemblyLinearVelocity = Vector3.new(clamped.X, vel.Y, clamped.Z)
+            local maxVel = getgenv().TSB_Core.Settings.ClampPower
+            
+            if flat.Magnitude > maxVel then
+                local clamped = flat.Unit * maxVel
+                currentRoot.AssemblyLinearVelocity = Vector3.new(clamped.X, vel.Y, clamped.Z)
             end
         end)
     end)
 end
 
+print("[TSB Engine] Part 1 Loaded. Dynamic Pointers Active.")
 -- ==========================================
--- UI MİMARİSİ (Rayfield Library Kullanarak)
+-- PART 2: RAYFIELD UI & ROBUST LISTENERS
+-- Language: English | Features: Keybind API, Auto-Detect
 -- ==========================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+if not getgenv().TSB_Core then
+    warn("[TSB UI] Core Engine (Part 1) missing! Execute Part 1 first.")
+    return
+end
+
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
 local Window = Rayfield:CreateWindow({
-    Name = "TSB Adaptif Engine | V2",
-    LoadingTitle = "Çekirdek Yükleniyor...",
-    LoadingSubtitle = "FPS & Ping Analizi Başlatıldı",
+    Name = "TSB Tech Engine | AI Adaptive",
+    LoadingTitle = "Initializing Modules...",
+    LoadingSubtitle = "Adaptive Algorithms Active",
     ConfigurationSaving = { Enabled = false }
 })
 
 local MainTab = Window:CreateTab("Auto-Tech", 4483362458)
 
 MainTab:CreateToggle({
-    Name = "Adaptif Tech Dash Aktif",
-    CurrentValue = false,
-    Flag = "Toggle_Tech",
+    Name = "Enable Engine",
+    CurrentValue = getgenv().TSB_Core.Settings.Enabled,
+    Flag = "Toggle_Engine",
     Callback = function(Value)
-        Settings.Enabled = Value
+        getgenv().TSB_Core.Settings.Enabled = Value
     end,
 })
 
 MainTab:CreateToggle({
-    Name = "Yapay Zeka Zamanlaması (Ping/FPS Bazlı)",
-    CurrentValue = true,
+    Name = "Adaptive Timing (Ping/FPS AI)",
+    CurrentValue = getgenv().TSB_Core.Settings.UseAdaptive,
     Flag = "Toggle_AI",
     Callback = function(Value)
-        Settings.UseAdaptive = Value
+        getgenv().TSB_Core.Settings.UseAdaptive = Value
+    end,
+})
+
+MainTab:CreateToggle({
+    Name = "Auto-Detect Uppercut (Beta)",
+    CurrentValue = false,
+    Flag = "Toggle_Auto",
+    Callback = function(Value)
+        getgenv().TSB_Core.Settings.AutoTrigger = Value
     end,
 })
 
 MainTab:CreateSlider({
-    Name = "Taban Gecikme (Base Delay)",
+    Name = "Base Delay",
     Range = {0.10, 0.40},
     Increment = 0.01,
-    CurrentValue = 0.20,
+    CurrentValue = getgenv().TSB_Core.Settings.BaseDelay,
     Flag = "Slider_Delay",
     Callback = function(Value)
-        Settings.BaseDelay = Value
+        getgenv().TSB_Core.Settings.BaseDelay = Value
     end,
 })
 
--- Dinleme Mekanizması (Sıcak Tuş Tetikleyici)
--- İleride bunu doğrudan saldırı state'lerine bağlayabiliriz, şimdilik E tuşu ile test edilir.
-getgenv().TSB_Engine.Connection = UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed or not Settings.Enabled then return end
+MainTab:CreateSlider({
+    Name = "Lock Distance (Studs)",
+    Range = {5, 30},
+    Increment = 1,
+    CurrentValue = getgenv().TSB_Core.Settings.MaxDistance,
+    Flag = "Slider_Dist",
+    Callback = function(Value)
+        getgenv().TSB_Core.Settings.MaxDistance = Value
+    end,
+})
+
+-- [YARDIMCI FONKSİYON: En Yakın Hedefi Bulma]
+local function FindClosestTarget()
+    local myChar = LocalPlayer.Character
+    if not myChar or not myChar:FindFirstChild("HumanoidRootPart") then return nil end
+    local myRoot = myChar.HumanoidRootPart
     
-    if input.KeyCode == Enum.KeyCode.E then
-        -- En yakın hedefi bul
-        local closest, minD = nil, Settings.MaxDistance
-        for _, p in pairs(Players:GetPlayers()) do
-            if p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
-                local d = (p.Character.HumanoidRootPart.Position - RootPart.Position).Magnitude
-                if d < minD then
+    local closest, minDst = nil, getgenv().TSB_Core.Settings.MaxDistance
+    for _, p in pairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+            local tHum = p.Character:FindFirstChild("Humanoid")
+            if tHum and tHum.Health > 0 then
+                local d = (p.Character.HumanoidRootPart.Position - myRoot.Position).Magnitude
+                if d < minDst then
                     closest = p.Character.HumanoidRootPart
-                    minD = d
+                    minDst = d
                 end
             end
         end
-        
-        if closest then
-            ExecuteAdaptiveDash(closest)
+    end
+    return closest
+end
+
+-- [1. MANUEL TETİKLEYİCİ: Rayfield Keybind API]
+MainTab:CreateKeybind({
+    Name = "Manual Dash Trigger",
+    CurrentKeybind = "E",
+    HoldToInteract = false,
+    Flag = "Keybind_Dash",
+    Callback = function()
+        if not getgenv().TSB_Core.Settings.Enabled then return end
+        local target = FindClosestTarget()
+        if target then
+            getgenv().TSB_Core.ExecuteDash(target)
+        end
+    end,
+})
+
+-- [2. OTOMATİK TETİKLEYİCİ: Velocity Scanner]
+-- Uppercut attığında dikey Y-Ekseni hızın aniden fırlar. Bunu tarayıp kendi kendine Q basar.
+if getgenv().TSB_AutoConn then getgenv().TSB_AutoConn:Disconnect() end
+local debounce = false
+
+getgenv().TSB_AutoConn = RunService.Heartbeat:Connect(function()
+    local settings = getgenv().TSB_Core.Settings
+    if not settings.Enabled or not settings.AutoTrigger or debounce then return end
+    
+    local myChar = LocalPlayer.Character
+    if myChar and myChar:FindFirstChild("HumanoidRootPart") then
+        local myRoot = myChar.HumanoidRootPart
+        -- Eğer karakter aniden yukarı 40 hızın üzerinde fırlarsa (Uppercut state)
+        if myRoot.AssemblyLinearVelocity.Y > 40 then
+            local target = FindClosestTarget()
+            if target then
+                debounce = true
+                getgenv().TSB_Core.ExecuteDash(target)
+                task.wait(1) -- Spam'ı önlemek için 1 saniye bekleme süresi
+                debounce = false
+            end
         end
     end
 end)
+
+print("[TSB UI] Interface & Bindings Loaded Successfully.")
